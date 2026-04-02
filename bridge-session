@@ -20,6 +20,7 @@ import socket
 import sys
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 DEFAULT_DIR = Path.home() / ".bridge"
@@ -42,9 +43,18 @@ def _is_pid_alive(pid: int) -> bool:
         return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return True  # Process exists but owned by another user
+
+
+def _validate_session_name(name: str):
+    if "/" in name or name.startswith("."):
+        print(f"Error: Invalid session name '{name}'. Must not contain '/' or start with '.'", file=sys.stderr)
+        sys.exit(1)
 
 
 def start_session(ssh_cmd: list[str], name: str, foreground: bool):
+    _validate_session_name(name)
     sock_path, pid_path, log_path = _session_paths(name)
     sock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -191,6 +201,7 @@ def start_session(ssh_cmd: list[str], name: str, foreground: bool):
 
 
 def stop_session(name: str):
+    _validate_session_name(name)
     sock_path, pid_path, _ = _session_paths(name)
     if not pid_path.exists():
         print(f"No active session '{name}' found.")
@@ -199,6 +210,11 @@ def stop_session(name: str):
     pid = int(pid_path.read_text().strip())
     if _is_pid_alive(pid):
         os.kill(pid, signal.SIGTERM)
+        # Wait for the daemon to clean up
+        for _ in range(20):
+            if not _is_pid_alive(pid):
+                break
+            time.sleep(0.25)
         print(f"Session '{name}' (pid {pid}) stopped.")
     else:
         print(f"Session '{name}' (pid {pid}) was not running. Cleaning up.")
@@ -211,6 +227,7 @@ def stop_session(name: str):
 
 
 def session_status(name: str):
+    _validate_session_name(name)
     sock_path, pid_path, _ = _session_paths(name)
     if not pid_path.exists():
         print(f"No active session '{name}'.")
