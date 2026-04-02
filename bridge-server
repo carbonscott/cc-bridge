@@ -144,7 +144,7 @@ def handle_grep(args: dict, root: Path) -> dict:
     return {"output": "\n".join(lines), "count": len(lines)}
 
 
-def _find_glob_tool() -> str | None:
+def _detect_glob_tool() -> str | None:
     """Detect available glob tool: fd > find > None (pathlib fallback)."""
     for tool in ("fd", "find"):
         if subprocess.run(["which", tool], capture_output=True).returncode == 0:
@@ -204,7 +204,7 @@ def handle_glob(args: dict, root: Path) -> dict:
     if not path.is_dir():
         raise FileNotFoundError(f"{args.get('path', '.')} is not a directory")
 
-    tool = _find_glob_tool()
+    tool = _detect_glob_tool()
     files = None
     if tool == "fd":
         files = _glob_fd(pattern, path)
