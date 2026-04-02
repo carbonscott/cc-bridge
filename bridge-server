@@ -167,7 +167,13 @@ def _glob_fd(pattern: str, path: Path) -> list[str]:
 
 
 def _glob_find(pattern: str, path: Path) -> list[str]:
-    """Run find with glob pattern, return relative file paths."""
+    """Run find with glob pattern, return relative file paths.
+
+    Falls back to None for patterns containing '**' since find does not
+    support recursive glob wildcards.
+    """
+    if "**" in pattern:
+        return None  # signal caller to fall back to pathlib
     # Patterns with '/' need -path, simple patterns use -name
     if "/" in pattern:
         cmd = ["find", str(path), "-type", "f", "-path", f"*/{pattern}"]
@@ -199,11 +205,12 @@ def handle_glob(args: dict, root: Path) -> dict:
         raise FileNotFoundError(f"{args.get('path', '.')} is not a directory")
 
     tool = _find_glob_tool()
+    files = None
     if tool == "fd":
         files = _glob_fd(pattern, path)
     elif tool == "find":
         files = _glob_find(pattern, path)
-    else:
+    if files is None:
         files = _glob_pathlib(pattern, path)
 
     truncated = len(files) > MAX_GLOB_FILES
