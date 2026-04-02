@@ -29,7 +29,35 @@ bridge bash "<command>"               # run a shell command
 bridge grep "<pattern>" --glob "*.py" # search files
 bridge glob "**/*.py"                 # find files
 bridge edit <path>                    # edit remote file in $EDITOR
+bridge status                         # check session is alive
 ```
+
+## Named Sessions
+
+Run multiple concurrent sessions by giving each a name:
+
+```bash
+# Start named sessions
+bridge-session start --name project-a -- ssh host 'uv run ~/bridge-server --root-dir /path/a'
+bridge-session start --name project-b -- ssh host 'uv run ~/bridge-server --root-dir /path/b'
+
+# Use by name
+bridge --session project-a read some/file
+bridge --session project-b grep "pattern"
+
+# List all sessions
+bridge-session list
+
+# Check a specific session
+bridge-session status project-a
+
+# Stop a session
+bridge-session stop project-a
+```
+
+Without `--name`, sessions default to `default`. Session files are stored under `~/.bridge/<name>/`.
+
+The `BRIDGE_SOCKET` environment variable overrides session name resolution when set directly to a socket path.
 
 ## Prerequisites
 
