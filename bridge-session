@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""cc-bridge session manager: holds a persistent SSH connection and
+exposes a Unix domain socket for local CLI access.
+
+Usage:
+    bridge-session start [--socket PATH] [--foreground] -- ssh host 'bridge-server --root-dir /path'
+    bridge-session stop  [--socket PATH]
+    bridge-session status [--socket PATH]
+"""
+
+import argparse
+import json
+import os
+import signal
+import socket
+import sys
+import subprocess
+import threading
+from pathlib import Path
+
+DEFAULT_DIR = Path.home() / ".bridge"
+DEFAULT_SOCKET = DEFAULT_DIR / "session.sock"
+DEFAULT_PID = DEFAULT_DIR / "session.pid"
+
+
+def start_session(ssh_cmd: list[str], sock_path: Path, foreground: bool):
+    sock_path = sock_path.resolve()
+    pid_path = sock_path.with_suffix(".pid")
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Clean up stale socket
+    if sock_path.exists():
+        sock_path.unlink()
+
+    if not foreground:
+        # Daemonize
+        pid = os.fork()
+        if pid > 0:
+            print(f"Session started (pid {pid}), socket: {sock_path}")
+            sys.exit(0)
+        os.setsid()
+        # Redirect stdio
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        log_path = sock_path.with_suffix(".log")
+        log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+
+    # Write PID file
+    pid_path.write_text(str(os.getpid()))
+
+    # Spawn SSH + bridge-server
+    proc = subprocess.Popen(
+        ssh_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    lock = threading.Lock()
+    server_alive = True
+
+    def handle_client(conn: socket.socket):
+        nonlocal server_alive
+        try:
+            # Read one JSON line from client
+            data = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+                if b"\n" in data:
+                    break
+
+            request_line = data.split(b"\n", 1)[0] + b"\n"
+
+            with lock:
+                if not server_alive:
+                    error = json.dumps({"id": "?", "ok": False, "error": "Server process is dead"}) + "\n"
+                    conn.sendall(error.encode())
+                    return
+
+                try:
+                    proc.stdin.write(request_line)
+                    proc.stdin.flush()
+                except BrokenPipeError:
+                    server_alive = False
+                    error = json.dumps({"id": "?", "ok": False, "error": "Server process died (broken pipe)"}) + "\n"
+                    conn.sendall(error.encode())
+                    return
+
+                # Read one JSON line response
+                response_line = proc.stdout.readline()
+                if not response_line:
+                    server_alive = False
+                    error = json.dumps({"id": "?", "ok": False, "error": "Server process died (EOF)"}) + "\n"
+                    conn.sendall(error.encode())
+                    return
+
+            conn.sendall(response_line)
+        except Exception as e:
+            try:
+                error = json.dumps({"id": "?", "ok": False, "error": f"Session error: {e}"}) + "\n"
+                conn.sendall(error.encode())
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+    # Create Unix domain socket
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(5)
+    srv.settimeout(1.0)  # Allow periodic check of process health
+
+    def cleanup(*_args):
+        srv.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        sock_path.unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    if foreground:
+        print(f"Session running (pid {os.getpid()}), socket: {sock_path}")
+        print(f"SSH command: {' '.join(ssh_cmd)}")
+        print("Press Ctrl-C to stop.")
+
+    try:
+        while True:
+            # Check if SSH process is still alive
+            if proc.poll() is not None:
+                stderr_out = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+                msg = f"SSH process exited with code {proc.returncode}"
+                if stderr_out.strip():
+                    msg += f": {stderr_out.strip()}"
+                print(msg, file=sys.stderr)
+                break
+
+            try:
+                conn, _ = srv.accept()
+                t = threading.Thread(target=handle_client, args=(conn,), daemon=True)
+                t.start()
+            except socket.timeout:
+                continue
+    finally:
+        cleanup()
+
+
+def stop_session(sock_path: Path):
+    pid_path = sock_path.with_suffix(".pid")
+    if not pid_path.exists():
+        print("No active session found.")
+        sys.exit(1)
+
+    pid = int(pid_path.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"Session (pid {pid}) stopped.")
+    except ProcessLookupError:
+        print(f"Session (pid {pid}) was not running. Cleaning up.")
+        sock_path.unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
+
+
+def session_status(sock_path: Path):
+    pid_path = sock_path.with_suffix(".pid")
+    if not pid_path.exists():
+        print("No active session.")
+        sys.exit(1)
+
+    pid = int(pid_path.read_text().strip())
+    try:
+        os.kill(pid, 0)  # Check if process exists
+        print(f"Session running (pid {pid}), socket: {sock_path}")
+    except ProcessLookupError:
+        print(f"Session (pid {pid}) is dead. Cleaning up.")
+        sock_path.unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="cc-bridge session manager")
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    p_start = sub.add_parser("start", help="Start a bridge session")
+    p_start.add_argument("--socket", type=Path, default=DEFAULT_SOCKET, help="Unix socket path")
+    p_start.add_argument("--foreground", action="store_true", help="Run in foreground (don't daemonize)")
+    p_start.add_argument("cmd", nargs=argparse.REMAINDER, help="SSH command (after --)")
+
+    p_stop = sub.add_parser("stop", help="Stop the bridge session")
+    p_stop.add_argument("--socket", type=Path, default=DEFAULT_SOCKET, help="Unix socket path")
+
+    p_status = sub.add_parser("status", help="Check session status")
+    p_status.add_argument("--socket", type=Path, default=DEFAULT_SOCKET, help="Unix socket path")
+
+    args = parser.parse_args()
+
+    if args.action == "start":
+        cmd = args.cmd
+        # Strip leading '--' if present
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        if not cmd:
+            print("Error: No SSH command provided. Usage: bridge-session start -- ssh host 'command'", file=sys.stderr)
+            sys.exit(1)
+        start_session(cmd, args.socket, args.foreground)
+    elif args.action == "stop":
+        stop_session(args.socket)
+    elif args.action == "status":
+        session_status(args.socket)
+
+
+if __name__ == "__main__":
+    main()

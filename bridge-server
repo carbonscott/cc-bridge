@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""cc-bridge server: JSON-over-stdio remote filesystem bridge.
+
+Reads NDJSON requests from stdin, executes filesystem/shell operations,
+writes NDJSON responses to stdout. Designed to run on a remote host
+behind an SSH connection.
+
+Usage:
+    bridge-server --root-dir /path/to/project
+    echo '{"id":"1","cmd":"read","args":{"path":"."}}' | bridge-server --root-dir /tmp
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+MAX_OUTPUT = 1_000_000  # 1MB default
+MAX_GREP_MATCHES = 1000
+MAX_GLOB_FILES = 10000
+
+
+def _resolve(path: str, root: Path) -> Path:
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p
+    return root / p
+
+
+def handle_read(args: dict, root: Path) -> dict:
+    path = args.get("path", ".")
+    offset = args.get("offset", 0)
+    limit = args.get("limit", 2000)
+
+    p = _resolve(path, root)
+    if not p.is_file():
+        raise FileNotFoundError(f"{path} is not a file or does not exist")
+
+    if args.get("raw"):
+        content = p.read_text(errors="replace")
+        return {"content": content, "total_lines": len(content.splitlines())}
+
+    lines = p.read_text(errors="replace").splitlines()
+    selected = lines[offset: offset + limit]
+    numbered = [f"{i + offset + 1:6}\t{line}" for i, line in enumerate(selected)]
+    content = "\n".join(numbered)
+    remaining = len(lines) - offset - limit
+    if remaining > 0:
+        content += f"\n... ({remaining} more lines)"
+
+    return {"content": content or "(empty file)", "total_lines": len(lines)}
+
+
+def handle_write(args: dict, root: Path) -> dict:
+    path = args["path"]
+    content = args["content"]
+
+    p = _resolve(path, root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+
+    return {"bytes_written": len(content), "path": str(p)}
+
+
+def handle_bash(args: dict, root: Path, max_output: int) -> dict:
+    command = args["command"]
+    timeout = args.get("timeout", 120)
+    cwd = str(_resolve(args["cwd"], root)) if "cwd" in args else str(root)
+
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": f"command timed out after {timeout}s", "exit_code": -1}
+
+    stdout = proc.stdout.decode(errors="replace")
+    stderr = proc.stderr.decode(errors="replace")
+
+    if len(stdout) > max_output:
+        stdout = stdout[:max_output] + f"\n[output truncated at {max_output} bytes]"
+    if len(stderr) > max_output:
+        stderr = stderr[:max_output] + f"\n[output truncated at {max_output} bytes]"
+
+    return {"stdout": stdout, "stderr": stderr, "exit_code": proc.returncode}
+
+
+def handle_grep(args: dict, root: Path) -> dict:
+    pattern = args["pattern"]
+    path = str(_resolve(args.get("path", "."), root))
+    glob_filter = args.get("glob")
+    file_type = args.get("type")
+    context = args.get("context", 0)
+    output_mode = args.get("output_mode", "content")
+
+    # Try ripgrep first, fall back to grep
+    for tool in ("rg", "grep"):
+        if subprocess.run(["which", tool], capture_output=True).returncode == 0:
+            break
+    else:
+        raise RuntimeError("Neither rg nor grep found on remote system")
+
+    cmd = [tool]
+    if tool == "rg":
+        if output_mode == "files_with_matches":
+            cmd += ["-l"]
+        elif output_mode == "count":
+            cmd += ["-c"]
+        if context > 0 and output_mode == "content":
+            cmd += [f"-C{context}"]
+        if glob_filter:
+            cmd += [f"--glob={glob_filter}"]
+        if file_type:
+            cmd += [f"--type={file_type}"]
+        cmd += ["-n", pattern, path]
+    else:
+        # grep fallback
+        if output_mode == "files_with_matches":
+            cmd += ["-rl"]
+        elif output_mode == "count":
+            cmd += ["-rc"]
+        else:
+            cmd += ["-rn"]
+        if context > 0 and output_mode == "content":
+            cmd += [f"-C{context}"]
+        cmd += [pattern, path]
+
+    proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    output = proc.stdout.decode(errors="replace")
+
+    lines = output.splitlines()
+    if len(lines) > MAX_GREP_MATCHES:
+        lines = lines[:MAX_GREP_MATCHES]
+        lines.append(f"[truncated at {MAX_GREP_MATCHES} matches]")
+
+    return {"output": "\n".join(lines), "count": len(lines)}
+
+
+def handle_glob(args: dict, root: Path) -> dict:
+    pattern = args["pattern"]
+    path = _resolve(args.get("path", "."), root)
+
+    if not path.is_dir():
+        raise FileNotFoundError(f"{args.get('path', '.')} is not a directory")
+
+    files = sorted(str(f.relative_to(path)) for f in path.glob(pattern) if f.is_file())
+
+    truncated = len(files) > MAX_GLOB_FILES
+    if truncated:
+        files = files[:MAX_GLOB_FILES]
+
+    return {"files": files, "count": len(files), "truncated": truncated}
+
+
+def dispatch(request: dict, root: Path, max_output: int) -> dict:
+    req_id = request.get("id", "?")
+    cmd = request.get("cmd")
+    args = request.get("args", {})
+
+    try:
+        if cmd == "read":
+            data = handle_read(args, root)
+        elif cmd == "write":
+            data = handle_write(args, root)
+        elif cmd == "bash":
+            data = handle_bash(args, root, max_output)
+        elif cmd == "grep":
+            data = handle_grep(args, root)
+        elif cmd == "glob":
+            data = handle_glob(args, root)
+        else:
+            return {"id": req_id, "ok": False, "error": f"Unknown command: {cmd}"}
+
+        return {"id": req_id, "ok": True, "data": data}
+
+    except Exception as e:
+        return {"id": req_id, "ok": False, "error": str(e)}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="cc-bridge server")
+    parser.add_argument("--root-dir", required=True, help="Base directory for file operations")
+    parser.add_argument("--max-output", type=int, default=MAX_OUTPUT, help="Max output bytes for bash (default: 1MB)")
+    args = parser.parse_args()
+
+    root = Path(args.root_dir).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: {args.root_dir} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as e:
+            response = {"id": "?", "ok": False, "error": f"Invalid JSON: {e}"}
+        else:
+            response = dispatch(request, root, args.max_output)
+
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
