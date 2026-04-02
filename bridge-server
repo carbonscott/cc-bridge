@@ -166,7 +166,7 @@ def _glob_fd(pattern: str, path: Path) -> list[str]:
     )
 
 
-def _glob_find(pattern: str, path: Path) -> list[str]:
+def _glob_find(pattern: str, path: Path) -> list[str] | None:
     """Run find with glob pattern, return relative file paths.
 
     Falls back to None for patterns containing '**' since find does not
@@ -176,7 +176,7 @@ def _glob_find(pattern: str, path: Path) -> list[str]:
         return None  # signal caller to fall back to pathlib
     # Patterns with '/' need -path, simple patterns use -name
     if "/" in pattern:
-        cmd = ["find", str(path), "-type", "f", "-path", f"*/{pattern}"]
+        cmd = ["find", str(path), "-type", "f", "-path", f"{path}/{pattern}"]
     else:
         cmd = ["find", str(path), "-type", "f", "-name", pattern]
     proc = subprocess.run(cmd, capture_output=True, timeout=60)
