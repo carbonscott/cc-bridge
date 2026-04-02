@@ -6,9 +6,10 @@
 exposes a Unix domain socket for local CLI access.
 
 Usage:
-    bridge-session start [--socket PATH] [--foreground] -- ssh host 'bridge-server --root-dir /path'
-    bridge-session stop  [--socket PATH]
-    bridge-session status [--socket PATH]
+    bridge-session start --name myproject -- ssh host 'bridge-server --root-dir /path'
+    bridge-session stop myproject
+    bridge-session status myproject
+    bridge-session list
 """
 
 import argparse
@@ -22,16 +23,43 @@ import threading
 from pathlib import Path
 
 DEFAULT_DIR = Path.home() / ".bridge"
-DEFAULT_SOCKET = DEFAULT_DIR / "session.sock"
-DEFAULT_PID = DEFAULT_DIR / "session.pid"
+DEFAULT_NAME = "default"
 
 
-def start_session(ssh_cmd: list[str], sock_path: Path, foreground: bool):
-    sock_path = sock_path.resolve()
-    pid_path = sock_path.with_suffix(".pid")
+def _session_dir(name: str) -> Path:
+    return DEFAULT_DIR / name
+
+
+def _session_paths(name: str) -> tuple[Path, Path, Path]:
+    """Return (socket_path, pid_path, log_path) for a named session."""
+    d = _session_dir(name)
+    return d / "session.sock", d / "session.pid", d / "session.log"
+
+
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def start_session(ssh_cmd: list[str], name: str, foreground: bool):
+    sock_path, pid_path, log_path = _session_paths(name)
     sock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Clean up stale socket
+    # Refuse to overwrite a live session
+    if pid_path.exists():
+        pid = int(pid_path.read_text().strip())
+        if _is_pid_alive(pid):
+            print(f"Error: Session '{name}' is already running (pid {pid}).", file=sys.stderr)
+            print(f"Stop it first: bridge-session stop {name}", file=sys.stderr)
+            sys.exit(1)
+        # Stale session — clean up
+        sock_path.unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
+
+    # Clean up stale socket (no PID file but socket lingers)
     if sock_path.exists():
         sock_path.unlink()
 
@@ -39,13 +67,12 @@ def start_session(ssh_cmd: list[str], sock_path: Path, foreground: bool):
         # Daemonize
         pid = os.fork()
         if pid > 0:
-            print(f"Session started (pid {pid}), socket: {sock_path}")
+            print(f"Session '{name}' started (pid {pid}), socket: {sock_path}")
             sys.exit(0)
         os.setsid()
         # Redirect stdio
         devnull = os.open(os.devnull, os.O_RDWR)
         os.dup2(devnull, 0)
-        log_path = sock_path.with_suffix(".log")
         log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         os.dup2(log_fd, 1)
         os.dup2(log_fd, 2)
@@ -127,13 +154,18 @@ def start_session(ssh_cmd: list[str], sock_path: Path, foreground: bool):
             proc.kill()
         sock_path.unlink(missing_ok=True)
         pid_path.unlink(missing_ok=True)
+        # Remove session directory if empty
+        try:
+            _session_dir(name).rmdir()
+        except OSError:
+            pass
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
     if foreground:
-        print(f"Session running (pid {os.getpid()}), socket: {sock_path}")
+        print(f"Session '{name}' running (pid {os.getpid()}), socket: {sock_path}")
         print(f"SSH command: {' '.join(ssh_cmd)}")
         print("Press Ctrl-C to stop.")
 
@@ -158,37 +190,66 @@ def start_session(ssh_cmd: list[str], sock_path: Path, foreground: bool):
         cleanup()
 
 
-def stop_session(sock_path: Path):
-    pid_path = sock_path.with_suffix(".pid")
+def stop_session(name: str):
+    sock_path, pid_path, _ = _session_paths(name)
     if not pid_path.exists():
-        print("No active session found.")
+        print(f"No active session '{name}' found.")
         sys.exit(1)
 
     pid = int(pid_path.read_text().strip())
-    try:
+    if _is_pid_alive(pid):
         os.kill(pid, signal.SIGTERM)
-        print(f"Session (pid {pid}) stopped.")
-    except ProcessLookupError:
-        print(f"Session (pid {pid}) was not running. Cleaning up.")
+        print(f"Session '{name}' (pid {pid}) stopped.")
+    else:
+        print(f"Session '{name}' (pid {pid}) was not running. Cleaning up.")
         sock_path.unlink(missing_ok=True)
         pid_path.unlink(missing_ok=True)
+        try:
+            _session_dir(name).rmdir()
+        except OSError:
+            pass
 
 
-def session_status(sock_path: Path):
-    pid_path = sock_path.with_suffix(".pid")
+def session_status(name: str):
+    sock_path, pid_path, _ = _session_paths(name)
     if not pid_path.exists():
-        print("No active session.")
+        print(f"No active session '{name}'.")
         sys.exit(1)
 
     pid = int(pid_path.read_text().strip())
-    try:
-        os.kill(pid, 0)  # Check if process exists
-        print(f"Session running (pid {pid}), socket: {sock_path}")
-    except ProcessLookupError:
-        print(f"Session (pid {pid}) is dead. Cleaning up.")
+    if _is_pid_alive(pid):
+        print(f"Session '{name}' running (pid {pid}), socket: {sock_path}")
+    else:
+        print(f"Session '{name}' (pid {pid}) is dead. Cleaning up.")
         sock_path.unlink(missing_ok=True)
         pid_path.unlink(missing_ok=True)
+        try:
+            _session_dir(name).rmdir()
+        except OSError:
+            pass
         sys.exit(1)
+
+
+def list_sessions():
+    if not DEFAULT_DIR.is_dir():
+        print("No sessions.")
+        return
+
+    found = False
+    for d in sorted(DEFAULT_DIR.iterdir()):
+        pid_path = d / "session.pid"
+        if not d.is_dir() or not pid_path.exists():
+            continue
+        name = d.name
+        pid = int(pid_path.read_text().strip())
+        alive = _is_pid_alive(pid)
+        status = "running" if alive else "dead"
+        sock_path = d / "session.sock"
+        print(f"{name}\tpid={pid}\t{status}\t{sock_path}")
+        found = True
+
+    if not found:
+        print("No sessions.")
 
 
 def main():
@@ -196,15 +257,17 @@ def main():
     sub = parser.add_subparsers(dest="action", required=True)
 
     p_start = sub.add_parser("start", help="Start a bridge session")
-    p_start.add_argument("--socket", type=Path, default=DEFAULT_SOCKET, help="Unix socket path")
+    p_start.add_argument("--name", default=DEFAULT_NAME, help="Session name (default: 'default')")
     p_start.add_argument("--foreground", action="store_true", help="Run in foreground (don't daemonize)")
     p_start.add_argument("cmd", nargs=argparse.REMAINDER, help="SSH command (after --)")
 
-    p_stop = sub.add_parser("stop", help="Stop the bridge session")
-    p_stop.add_argument("--socket", type=Path, default=DEFAULT_SOCKET, help="Unix socket path")
+    p_stop = sub.add_parser("stop", help="Stop a bridge session")
+    p_stop.add_argument("name", nargs="?", default=DEFAULT_NAME, help="Session name (default: 'default')")
 
     p_status = sub.add_parser("status", help="Check session status")
-    p_status.add_argument("--socket", type=Path, default=DEFAULT_SOCKET, help="Unix socket path")
+    p_status.add_argument("name", nargs="?", default=DEFAULT_NAME, help="Session name (default: 'default')")
+
+    sub.add_parser("list", help="List all sessions")
 
     args = parser.parse_args()
 
@@ -216,11 +279,13 @@ def main():
         if not cmd:
             print("Error: No SSH command provided. Usage: bridge-session start -- ssh host 'command'", file=sys.stderr)
             sys.exit(1)
-        start_session(cmd, args.socket, args.foreground)
+        start_session(cmd, args.name, args.foreground)
     elif args.action == "stop":
-        stop_session(args.socket)
+        stop_session(args.name)
     elif args.action == "status":
-        session_status(args.socket)
+        session_status(args.name)
+    elif args.action == "list":
+        list_sessions()
 
 
 if __name__ == "__main__":

@@ -26,7 +26,16 @@ import time
 import uuid
 from pathlib import Path
 
-DEFAULT_SOCKET = Path.home() / ".bridge" / "session.sock"
+DEFAULT_DIR = Path.home() / ".bridge"
+DEFAULT_NAME = "default"
+
+
+def _resolve_socket(session_name: str) -> Path:
+    """Resolve the socket path for a named session."""
+    env = os.environ.get("BRIDGE_SOCKET")
+    if env:
+        return Path(env)
+    return DEFAULT_DIR / session_name / "session.sock"
 
 
 def send_request(request: dict, sock_path: Path) -> dict:
@@ -34,8 +43,8 @@ def send_request(request: dict, sock_path: Path) -> dict:
     try:
         sock.connect(str(sock_path))
     except (ConnectionRefusedError, FileNotFoundError):
-        print("Error: No active bridge session. Start one with:", file=sys.stderr)
-        print("  bridge-session start -- ssh host 'bridge-server --root-dir /path'", file=sys.stderr)
+        print(f"Error: No active bridge session at {sock_path}", file=sys.stderr)
+        print("  Start one with: bridge-session start --name <name> -- ssh host 'bridge-server --root-dir /path'", file=sys.stderr)
         sys.exit(2)
 
     try:
@@ -258,9 +267,8 @@ def cmd_edit(args, sock_path):
 
 
 def main():
-    sock_path = Path(os.environ.get("BRIDGE_SOCKET", str(DEFAULT_SOCKET)))
-
     parser = argparse.ArgumentParser(description="cc-bridge CLI", prog="bridge")
+    parser.add_argument("--session", default=DEFAULT_NAME, help="Session name (default: 'default')")
     sub = parser.add_subparsers(dest="subcmd", required=True)
 
     # read
@@ -302,6 +310,7 @@ def main():
     p_edit.add_argument("--editor", help="Override $EDITOR (default: vi)")
 
     args = parser.parse_args()
+    sock_path = _resolve_socket(args.session)
 
     handlers = {
         "read": cmd_read,
