@@ -48,6 +48,9 @@ bridge --session project-b grep "pattern"
 # List all sessions
 bridge-session list
 
+# Check a specific session
+bridge-session status project-a
+
 # Stop a session
 bridge-session stop project-a
 ```
