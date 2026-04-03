@@ -17,6 +17,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 MAX_OUTPUT = 1_000_000  # 1MB default
@@ -71,26 +72,34 @@ def handle_bash(args: dict, root: Path, max_output: int) -> dict:
     timeout = args.get("timeout", 120)
     cwd = str(_resolve(args["cwd"], root)) if "cwd" in args else str(root)
 
-    try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            cwd=cwd,
-            capture_output=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": f"command timed out after {timeout}s", "exit_code": -1}
+    with tempfile.TemporaryFile() as tmp_out, tempfile.TemporaryFile() as tmp_err:
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=cwd,
+                stdout=tmp_out,
+                stderr=tmp_err,
+                timeout=timeout,
+            )
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            exit_code = -1
 
-    stdout = proc.stdout.decode(errors="replace")
-    stderr = proc.stderr.decode(errors="replace")
+        tmp_out.seek(0)
+        tmp_err.seek(0)
+        stdout = tmp_out.read().decode(errors="replace")
+        stderr = tmp_err.read().decode(errors="replace")
+
+    if exit_code == -1 and not stderr:
+        stderr = f"command timed out after {timeout}s"
 
     if len(stdout) > max_output:
         stdout = stdout[:max_output] + f"\n[output truncated at {max_output} bytes]"
     if len(stderr) > max_output:
         stderr = stderr[:max_output] + f"\n[output truncated at {max_output} bytes]"
 
-    return {"stdout": stdout, "stderr": stderr, "exit_code": proc.returncode}
+    return {"stdout": stdout, "stderr": stderr, "exit_code": exit_code}
 
 
 def handle_grep(args: dict, root: Path) -> dict:
