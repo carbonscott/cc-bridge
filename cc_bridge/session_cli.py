@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.10"
-# ///
 """cc-bridge session manager: holds a persistent SSH connection and
 exposes a Unix domain socket for local CLI access.
 

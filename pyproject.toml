@@ -1,0 +1,13 @@
+[project]
+name = "cc-bridge"
+version = "0.1.0"
+description = "Minimal bridge for Claude Code remote filesystem access over SSH"
+requires-python = ">=3.10"
+
+[project.scripts]
+bridge = "cc_bridge.bridge_cli:main"
+bridge-session = "cc_bridge.session_cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

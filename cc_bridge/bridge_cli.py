@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.10"
-# ///
 """cc-bridge CLI: send commands to a running bridge session.
 
 Usage:

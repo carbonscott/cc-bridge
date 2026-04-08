@@ -1,0 +1,9 @@
+.lnb.env
+.lnb/
+
+# Python packaging
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/

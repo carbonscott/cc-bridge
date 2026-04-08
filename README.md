@@ -8,16 +8,24 @@ Minimal bridge for Claude Code remote filesystem access over SSH. Runs a lightwe
 - **bridge-server** — stateless NDJSON-over-stdio server; runs on the remote host
 - **bridge** — CLI client; sends commands to the session socket
 
+## Installation
+
+```bash
+uv tool install -e ~/codes/cc-bridge
+```
+
+This makes `bridge` and `bridge-session` available globally. With the editable install (`-e`), source changes take effect immediately.
+
 ## Setup
 
 **1. Start a session:**
 ```bash
-uv run ~/codes/cc-bridge/bridge-session start -- ssh YOUR_HOST 'uv run ~/bridge-server --root-dir /path/to/project'
+bridge-session start -- ssh YOUR_HOST 'uv run ~/bridge-server --root-dir /path/to/project'
 ```
 
 **2. Verify it's running:**
 ```bash
-uv run ~/codes/cc-bridge/bridge status
+bridge status
 ```
 
 **3. Use the CLI:**
@@ -62,7 +70,7 @@ The `BRIDGE_SOCKET` environment variable overrides session name resolution when 
 ## Prerequisites
 
 - Python 3.10+ on both local and remote
-- `uv` on both local and remote
+- `uv` on local (for install) and remote (for `bridge-server`)
 - SSH key-based auth (no password prompts)
 
 ## Tips
