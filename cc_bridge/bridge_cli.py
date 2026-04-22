@@ -1,29 +1,23 @@
 """cc-bridge CLI: send commands to a running bridge session.
 
 Usage:
-    bridge [--timeout N] read <path> [--offset N] [--limit N]
-    bridge [--timeout N] write <path> [--file LOCAL_FILE | stdin]
-    bridge [--timeout N] bash <command>
-    bridge [--timeout N] grep <pattern> [--path PATH] [--glob GLOB] [--type TYPE] [--context N] [--mode content|files|count]
-    bridge [--timeout N] glob <pattern> [--path PATH]
-    bridge status
-    bridge edit <path> [--editor EDITOR]
+    bridge [--session NAME] [--timeout N] [--max-output N] read <path> [--offset N] [--limit N] [--raw]
+    bridge [--session NAME] [--timeout N] [--max-output N] write <path> [--file LOCAL_FILE | stdin]
+    bridge [--session NAME] [--timeout N] [--max-output N] bash <command>
+    bridge [--session NAME] status
 """
 
 import argparse
 import json
 import os
 import socket
-import subprocess
 import sys
-import tempfile
-import threading
-import time
 import uuid
 from pathlib import Path
 
 DEFAULT_DIR = Path.home() / ".bridge"
 DEFAULT_NAME = "default"
+DEFAULT_MAX_OUTPUT = 1_000_000
 
 
 def _resolve_socket(session_name: str) -> Path:
@@ -77,6 +71,8 @@ def cmd_read(args, sock_path):
         request["args"]["offset"] = args.offset
     if args.limit:
         request["args"]["limit"] = args.limit
+    if args.raw:
+        request["args"]["raw"] = True
 
     resp = send_request(request, sock_path)
     if not resp.get("ok"):
@@ -109,7 +105,11 @@ def cmd_bash(args, sock_path):
     request = {
         "id": make_id(),
         "cmd": "bash",
-        "args": {"command": args.command, "timeout": args.timeout},
+        "args": {
+            "command": args.command,
+            "timeout": args.timeout,
+            "max_output": args.max_output,
+        },
     }
 
     resp = send_request(request, sock_path)
@@ -127,51 +127,6 @@ def cmd_bash(args, sock_path):
         sys.exit(d["exit_code"])
 
 
-def cmd_grep(args, sock_path):
-    request = {
-        "id": make_id(),
-        "cmd": "grep",
-        "args": {"pattern": args.pattern, "timeout": args.timeout},
-    }
-    if args.path:
-        request["args"]["path"] = args.path
-    if args.glob:
-        request["args"]["glob"] = args.glob
-    if args.type:
-        request["args"]["type"] = args.type
-    if args.context:
-        request["args"]["context"] = args.context
-    if args.mode:
-        request["args"]["output_mode"] = args.mode
-
-    resp = send_request(request, sock_path)
-    if not resp.get("ok"):
-        print(f"Error: {resp.get('error', 'unknown')}", file=sys.stderr)
-        sys.exit(1)
-    print(resp["data"]["output"])
-
-
-def cmd_glob(args, sock_path):
-    request = {
-        "id": make_id(),
-        "cmd": "glob",
-        "args": {"pattern": args.pattern, "timeout": args.timeout},
-    }
-    if args.path:
-        request["args"]["path"] = args.path
-
-    resp = send_request(request, sock_path)
-    if not resp.get("ok"):
-        print(f"Error: {resp.get('error', 'unknown')}", file=sys.stderr)
-        sys.exit(1)
-
-    d = resp["data"]
-    for f in d["files"]:
-        print(f)
-    if d.get("truncated"):
-        print(f"[truncated at {d['count']} files]", file=sys.stderr)
-
-
 def cmd_status(args, sock_path):
     request = {"id": make_id(), "cmd": "bash", "args": {"command": "echo ok"}}
     resp = send_request(request, sock_path)
@@ -182,89 +137,13 @@ def cmd_status(args, sock_path):
         sys.exit(1)
 
 
-def cmd_edit(args, sock_path):
-    editor = args.editor or os.environ.get("EDITOR", "vi")
-
-    # Pull raw file content from remote
-    request = {
-        "id": make_id(),
-        "cmd": "read",
-        "args": {"path": args.path, "raw": True},
-    }
-    resp = send_request(request, sock_path)
-    if not resp.get("ok"):
-        print(f"Error: {resp.get('error', 'unknown')}", file=sys.stderr)
-        sys.exit(1)
-    content = resp["data"]["content"]
-
-    suffix = Path(args.path).suffix
-    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, mode="w")
-    tmp.write(content)
-    tmp.close()
-    tmp_path = tmp.name
-
-    last_mtime = os.stat(tmp_path).st_mtime
-    last_synced_content = content
-    stop_event = threading.Event()
-
-    def watch_and_sync():
-        nonlocal last_mtime, last_synced_content
-        while not stop_event.is_set():
-            time.sleep(1)
-            try:
-                mtime = os.stat(tmp_path).st_mtime
-            except FileNotFoundError:
-                break
-            if mtime != last_mtime:
-                new_content = Path(tmp_path).read_text()
-                if new_content != last_synced_content:
-                    write_req = {
-                        "id": make_id(),
-                        "cmd": "write",
-                        "args": {"path": args.path, "content": new_content},
-                    }
-                    write_resp = send_request(write_req, sock_path)
-                    if write_resp.get("ok"):
-                        print(f"\n[bridge] Synced to remote ({write_resp['data']['bytes_written']} bytes)")
-                    else:
-                        print(f"\n[bridge] Sync failed: {write_resp.get('error', 'unknown')}", file=sys.stderr)
-                    last_synced_content = new_content
-                last_mtime = mtime
-
-    watcher = threading.Thread(target=watch_and_sync, daemon=True)
-    watcher.start()
-
-    try:
-        subprocess.run([editor, tmp_path])
-    finally:
-        stop_event.set()
-        watcher.join(timeout=3)
-
-        # Final sync if content changed since last sync
-        try:
-            final_content = Path(tmp_path).read_text()
-            if final_content != last_synced_content:
-                write_req = {
-                    "id": make_id(),
-                    "cmd": "write",
-                    "args": {"path": args.path, "content": final_content},
-                }
-                write_resp = send_request(write_req, sock_path)
-                if write_resp.get("ok"):
-                    print(f"[bridge] Final sync to remote ({write_resp['data']['bytes_written']} bytes)")
-                else:
-                    print(f"[bridge] Final sync failed: {write_resp.get('error', 'unknown')}", file=sys.stderr)
-        except FileNotFoundError:
-            pass
-
-        os.unlink(tmp_path)
-
-
 def main():
     parser = argparse.ArgumentParser(description="cc-bridge CLI", prog="bridge")
     parser.add_argument("--session", default=DEFAULT_NAME, help="Session name (default: 'default')")
     parser.add_argument("--timeout", type=int, default=120,
-                        help="Subprocess timeout in seconds for bash/grep/glob (default: 120)")
+                        help="Subprocess timeout in seconds for bash (default: 120)")
+    parser.add_argument("--max-output", type=int, default=DEFAULT_MAX_OUTPUT,
+                        help="Max output bytes for bash (default: 1000000)")
     sub = parser.add_subparsers(dest="subcmd", required=True)
 
     # read
@@ -272,6 +151,8 @@ def main():
     p_read.add_argument("path", help="File path (relative to root-dir)")
     p_read.add_argument("--offset", type=int, help="Start from line N (0-based)")
     p_read.add_argument("--limit", type=int, help="Max lines to read")
+    p_read.add_argument("--raw", action="store_true",
+                        help="Return raw content (no line numbers); safe to redirect to a file")
 
     # write
     p_write = sub.add_parser("write", help="Write a file (reads from stdin or --file)")
@@ -282,27 +163,8 @@ def main():
     p_bash = sub.add_parser("bash", help="Run a shell command")
     p_bash.add_argument("command", help="Command to execute")
 
-    # grep
-    p_grep = sub.add_parser("grep", help="Search file contents")
-    p_grep.add_argument("pattern", help="Regex pattern")
-    p_grep.add_argument("--path", help="Directory to search (relative to root-dir)")
-    p_grep.add_argument("--glob", help="File glob filter (e.g. '*.py')")
-    p_grep.add_argument("--type", help="File type filter (e.g. 'py')")
-    p_grep.add_argument("--context", type=int, help="Context lines around matches")
-    p_grep.add_argument("--mode", choices=["content", "files", "count"], help="Output mode")
-
-    # glob
-    p_glob = sub.add_parser("glob", help="Find files by pattern")
-    p_glob.add_argument("pattern", help="Glob pattern (e.g. '**/*.py')")
-    p_glob.add_argument("--path", help="Base directory (relative to root-dir)")
-
     # status
     sub.add_parser("status", help="Check if bridge session is alive")
-
-    # edit
-    p_edit = sub.add_parser("edit", help="Edit a remote file in $EDITOR")
-    p_edit.add_argument("path", help="Remote file path")
-    p_edit.add_argument("--editor", help="Override $EDITOR (default: vi)")
 
     args = parser.parse_args()
     sock_path = _resolve_socket(args.session)
@@ -311,10 +173,7 @@ def main():
         "read": cmd_read,
         "write": cmd_write,
         "bash": cmd_bash,
-        "grep": cmd_grep,
-        "glob": cmd_glob,
         "status": cmd_status,
-        "edit": cmd_edit,
     }
     handlers[args.subcmd](args, sock_path)
 
