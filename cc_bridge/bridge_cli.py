@@ -78,7 +78,10 @@ def cmd_read(args, sock_path):
     if not resp.get("ok"):
         print(f"Error: {resp.get('error', 'unknown')}", file=sys.stderr)
         sys.exit(1)
-    print(resp["data"]["content"])
+    if args.raw:
+        sys.stdout.write(resp["data"]["content"])
+    else:
+        print(resp["data"]["content"])
 
 
 def cmd_write(args, sock_path):

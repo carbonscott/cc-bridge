@@ -39,11 +39,20 @@ def handle_read(args: dict, root: Path) -> dict:
     if not p.is_file():
         raise FileNotFoundError(f"{path} is not a file or does not exist")
 
-    if args.get("raw"):
-        content = p.read_text(errors="replace")
-        return {"content": content, "total_lines": len(content.splitlines())}
+    text = p.read_text(errors="replace")
 
-    lines = p.read_text(errors="replace").splitlines()
+    if args.get("raw"):
+        total_lines = len(text.splitlines())
+        # Apply offset/limit only when explicitly provided — default is full file.
+        if "offset" in args or "limit" in args:
+            lines = text.splitlines(keepends=True)
+            selected = lines[offset: offset + limit]
+            content = "".join(selected)
+        else:
+            content = text
+        return {"content": content, "total_lines": total_lines}
+
+    lines = text.splitlines()
     selected = lines[offset: offset + limit]
     numbered = [f"{i + offset + 1:6}\t{line}" for i, line in enumerate(selected)]
     content = "\n".join(numbered)
