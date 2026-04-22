@@ -20,9 +20,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-MAX_OUTPUT = 1_000_000  # 1MB default
-MAX_GREP_MATCHES = 1000
-MAX_GLOB_FILES = 10000
+MAX_OUTPUT = 1_000_000  # 1MB fallback if client doesn't send max_output
 
 
 def _resolve(path: str, root: Path) -> Path:
@@ -41,11 +39,20 @@ def handle_read(args: dict, root: Path) -> dict:
     if not p.is_file():
         raise FileNotFoundError(f"{path} is not a file or does not exist")
 
-    if args.get("raw"):
-        content = p.read_text(errors="replace")
-        return {"content": content, "total_lines": len(content.splitlines())}
+    text = p.read_text(errors="replace")
 
-    lines = p.read_text(errors="replace").splitlines()
+    if args.get("raw"):
+        total_lines = len(text.splitlines())
+        # Apply offset/limit only when explicitly provided — default is full file.
+        if "offset" in args or "limit" in args:
+            lines = text.splitlines(keepends=True)
+            selected = lines[offset: offset + limit]
+            content = "".join(selected)
+        else:
+            content = text
+        return {"content": content, "total_lines": total_lines}
+
+    lines = text.splitlines()
     selected = lines[offset: offset + limit]
     numbered = [f"{i + offset + 1:6}\t{line}" for i, line in enumerate(selected)]
     content = "\n".join(numbered)
@@ -67,9 +74,10 @@ def handle_write(args: dict, root: Path) -> dict:
     return {"bytes_written": len(content), "path": str(p)}
 
 
-def handle_bash(args: dict, root: Path, max_output: int) -> dict:
+def handle_bash(args: dict, root: Path) -> dict:
     command = args["command"]
     timeout = args.get("timeout", 120)
+    max_output = args.get("max_output", MAX_OUTPUT)
     cwd = str(_resolve(args["cwd"], root)) if "cwd" in args else str(root)
 
     with tempfile.TemporaryFile() as tmp_out, tempfile.TemporaryFile() as tmp_err:
@@ -102,136 +110,7 @@ def handle_bash(args: dict, root: Path, max_output: int) -> dict:
     return {"stdout": stdout, "stderr": stderr, "exit_code": exit_code}
 
 
-def handle_grep(args: dict, root: Path) -> dict:
-    pattern = args["pattern"]
-    path = str(_resolve(args.get("path", "."), root))
-    glob_filter = args.get("glob")
-    file_type = args.get("type")
-    context = args.get("context", 0)
-    output_mode = args.get("output_mode", "content")
-    timeout = args.get("timeout", 120)
-
-    # Try ripgrep first, fall back to grep
-    for tool in ("rg", "grep"):
-        if subprocess.run(["which", tool], capture_output=True).returncode == 0:
-            break
-    else:
-        raise RuntimeError("Neither rg nor grep found on remote system")
-
-    cmd = [tool]
-    if tool == "rg":
-        if output_mode == "files_with_matches":
-            cmd += ["-l"]
-        elif output_mode == "count":
-            cmd += ["-c"]
-        if context > 0 and output_mode == "content":
-            cmd += [f"-C{context}"]
-        if glob_filter:
-            cmd += [f"--glob={glob_filter}"]
-        if file_type:
-            cmd += [f"--type={file_type}"]
-        cmd += ["-n", pattern, path]
-    else:
-        # grep fallback
-        if output_mode == "files_with_matches":
-            cmd += ["-rl"]
-        elif output_mode == "count":
-            cmd += ["-rc"]
-        else:
-            cmd += ["-rn"]
-        if context > 0 and output_mode == "content":
-            cmd += [f"-C{context}"]
-        cmd += [pattern, path]
-
-    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
-    output = proc.stdout.decode(errors="replace")
-
-    lines = output.splitlines()
-    if len(lines) > MAX_GREP_MATCHES:
-        lines = lines[:MAX_GREP_MATCHES]
-        lines.append(f"[truncated at {MAX_GREP_MATCHES} matches]")
-
-    return {"output": "\n".join(lines), "count": len(lines)}
-
-
-def _detect_glob_tool() -> str | None:
-    """Detect available glob tool: fd > find > None (pathlib fallback)."""
-    for tool in ("fd", "find"):
-        if subprocess.run(["which", tool], capture_output=True).returncode == 0:
-            return tool
-    return None
-
-
-def _glob_fd(pattern: str, path: Path, timeout: int) -> list[str]:
-    """Run fd with glob pattern, return relative file paths."""
-    cmd = ["fd", "--glob", pattern, "--type", "f", str(path)]
-    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
-    if proc.returncode not in (0, 1):  # 1 = no matches
-        raise RuntimeError(f"fd failed: {proc.stderr.decode(errors='replace')}")
-    output = proc.stdout.decode(errors="replace").strip()
-    if not output:
-        return []
-    return sorted(
-        str(Path(f).relative_to(path)) for f in output.splitlines()
-    )
-
-
-def _glob_find(pattern: str, path: Path, timeout: int) -> list[str] | None:
-    """Run find with glob pattern, return relative file paths.
-
-    Falls back to None for patterns containing '**' since find does not
-    support recursive glob wildcards.
-    """
-    if "**" in pattern:
-        return None  # signal caller to fall back to pathlib
-    # Patterns with '/' need -path, simple patterns use -name
-    if "/" in pattern:
-        cmd = ["find", str(path), "-type", "f", "-path", f"{path}/{pattern}"]
-    else:
-        cmd = ["find", str(path), "-type", "f", "-name", pattern]
-    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise RuntimeError(f"find failed: {proc.stderr.decode(errors='replace')}")
-    output = proc.stdout.decode(errors="replace").strip()
-    if not output:
-        return []
-    return sorted(
-        str(Path(f).relative_to(path)) for f in output.splitlines()
-    )
-
-
-def _glob_pathlib(pattern: str, path: Path) -> list[str]:
-    """Python pathlib fallback for glob."""
-    return sorted(
-        str(f.relative_to(path)) for f in path.glob(pattern) if f.is_file()
-    )
-
-
-def handle_glob(args: dict, root: Path) -> dict:
-    pattern = args["pattern"]
-    path = _resolve(args.get("path", "."), root)
-    timeout = args.get("timeout", 120)
-
-    if not path.is_dir():
-        raise FileNotFoundError(f"{args.get('path', '.')} is not a directory")
-
-    tool = _detect_glob_tool()
-    files = None
-    if tool == "fd":
-        files = _glob_fd(pattern, path, timeout)
-    elif tool == "find":
-        files = _glob_find(pattern, path, timeout)
-    if files is None:
-        files = _glob_pathlib(pattern, path)
-
-    truncated = len(files) > MAX_GLOB_FILES
-    if truncated:
-        files = files[:MAX_GLOB_FILES]
-
-    return {"files": files, "count": len(files), "truncated": truncated}
-
-
-def dispatch(request: dict, root: Path, max_output: int) -> dict:
+def dispatch(request: dict, root: Path) -> dict:
     req_id = request.get("id", "?")
     cmd = request.get("cmd")
     args = request.get("args", {})
@@ -242,11 +121,7 @@ def dispatch(request: dict, root: Path, max_output: int) -> dict:
         elif cmd == "write":
             data = handle_write(args, root)
         elif cmd == "bash":
-            data = handle_bash(args, root, max_output)
-        elif cmd == "grep":
-            data = handle_grep(args, root)
-        elif cmd == "glob":
-            data = handle_glob(args, root)
+            data = handle_bash(args, root)
         else:
             return {"id": req_id, "ok": False, "error": f"Unknown command: {cmd}"}
 
@@ -259,7 +134,6 @@ def dispatch(request: dict, root: Path, max_output: int) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="cc-bridge server")
     parser.add_argument("--root-dir", required=True, help="Base directory for file operations")
-    parser.add_argument("--max-output", type=int, default=MAX_OUTPUT, help="Max output bytes for bash (default: 1MB)")
     args = parser.parse_args()
 
     root = Path(args.root_dir).expanduser().resolve()
@@ -276,7 +150,7 @@ def main():
         except json.JSONDecodeError as e:
             response = {"id": "?", "ok": False, "error": f"Invalid JSON: {e}"}
         else:
-            response = dispatch(request, root, args.max_output)
+            response = dispatch(request, root)
 
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()
