@@ -109,6 +109,7 @@ def handle_grep(args: dict, root: Path) -> dict:
     file_type = args.get("type")
     context = args.get("context", 0)
     output_mode = args.get("output_mode", "content")
+    timeout = args.get("timeout", 120)
 
     # Try ripgrep first, fall back to grep
     for tool in ("rg", "grep"):
@@ -142,7 +143,7 @@ def handle_grep(args: dict, root: Path) -> dict:
             cmd += [f"-C{context}"]
         cmd += [pattern, path]
 
-    proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
     output = proc.stdout.decode(errors="replace")
 
     lines = output.splitlines()
@@ -161,10 +162,10 @@ def _detect_glob_tool() -> str | None:
     return None
 
 
-def _glob_fd(pattern: str, path: Path) -> list[str]:
+def _glob_fd(pattern: str, path: Path, timeout: int) -> list[str]:
     """Run fd with glob pattern, return relative file paths."""
     cmd = ["fd", "--glob", pattern, "--type", "f", str(path)]
-    proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
     if proc.returncode not in (0, 1):  # 1 = no matches
         raise RuntimeError(f"fd failed: {proc.stderr.decode(errors='replace')}")
     output = proc.stdout.decode(errors="replace").strip()
@@ -175,7 +176,7 @@ def _glob_fd(pattern: str, path: Path) -> list[str]:
     )
 
 
-def _glob_find(pattern: str, path: Path) -> list[str] | None:
+def _glob_find(pattern: str, path: Path, timeout: int) -> list[str] | None:
     """Run find with glob pattern, return relative file paths.
 
     Falls back to None for patterns containing '**' since find does not
@@ -188,7 +189,7 @@ def _glob_find(pattern: str, path: Path) -> list[str] | None:
         cmd = ["find", str(path), "-type", "f", "-path", f"{path}/{pattern}"]
     else:
         cmd = ["find", str(path), "-type", "f", "-name", pattern]
-    proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(f"find failed: {proc.stderr.decode(errors='replace')}")
     output = proc.stdout.decode(errors="replace").strip()
@@ -209,6 +210,7 @@ def _glob_pathlib(pattern: str, path: Path) -> list[str]:
 def handle_glob(args: dict, root: Path) -> dict:
     pattern = args["pattern"]
     path = _resolve(args.get("path", "."), root)
+    timeout = args.get("timeout", 120)
 
     if not path.is_dir():
         raise FileNotFoundError(f"{args.get('path', '.')} is not a directory")
@@ -216,9 +218,9 @@ def handle_glob(args: dict, root: Path) -> dict:
     tool = _detect_glob_tool()
     files = None
     if tool == "fd":
-        files = _glob_fd(pattern, path)
+        files = _glob_fd(pattern, path, timeout)
     elif tool == "find":
-        files = _glob_find(pattern, path)
+        files = _glob_find(pattern, path, timeout)
     if files is None:
         files = _glob_pathlib(pattern, path)
 

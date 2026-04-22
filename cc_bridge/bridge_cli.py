@@ -1,11 +1,11 @@
 """cc-bridge CLI: send commands to a running bridge session.
 
 Usage:
-    bridge read <path> [--offset N] [--limit N]
-    bridge write <path> [--file LOCAL_FILE | stdin]
-    bridge bash <command> [--timeout N]
-    bridge grep <pattern> [--path PATH] [--glob GLOB] [--type TYPE] [--context N] [--mode content|files|count]
-    bridge glob <pattern> [--path PATH]
+    bridge [--timeout N] read <path> [--offset N] [--limit N]
+    bridge [--timeout N] write <path> [--file LOCAL_FILE | stdin]
+    bridge [--timeout N] bash <command>
+    bridge [--timeout N] grep <pattern> [--path PATH] [--glob GLOB] [--type TYPE] [--context N] [--mode content|files|count]
+    bridge [--timeout N] glob <pattern> [--path PATH]
     bridge status
     bridge edit <path> [--editor EDITOR]
 """
@@ -109,10 +109,8 @@ def cmd_bash(args, sock_path):
     request = {
         "id": make_id(),
         "cmd": "bash",
-        "args": {"command": args.command},
+        "args": {"command": args.command, "timeout": args.timeout},
     }
-    if args.timeout:
-        request["args"]["timeout"] = args.timeout
 
     resp = send_request(request, sock_path)
     if not resp.get("ok"):
@@ -133,7 +131,7 @@ def cmd_grep(args, sock_path):
     request = {
         "id": make_id(),
         "cmd": "grep",
-        "args": {"pattern": args.pattern},
+        "args": {"pattern": args.pattern, "timeout": args.timeout},
     }
     if args.path:
         request["args"]["path"] = args.path
@@ -157,7 +155,7 @@ def cmd_glob(args, sock_path):
     request = {
         "id": make_id(),
         "cmd": "glob",
-        "args": {"pattern": args.pattern},
+        "args": {"pattern": args.pattern, "timeout": args.timeout},
     }
     if args.path:
         request["args"]["path"] = args.path
@@ -265,6 +263,8 @@ def cmd_edit(args, sock_path):
 def main():
     parser = argparse.ArgumentParser(description="cc-bridge CLI", prog="bridge")
     parser.add_argument("--session", default=DEFAULT_NAME, help="Session name (default: 'default')")
+    parser.add_argument("--timeout", type=int, default=120,
+                        help="Subprocess timeout in seconds for bash/grep/glob (default: 120)")
     sub = parser.add_subparsers(dest="subcmd", required=True)
 
     # read
@@ -281,7 +281,6 @@ def main():
     # bash
     p_bash = sub.add_parser("bash", help="Run a shell command")
     p_bash.add_argument("command", help="Command to execute")
-    p_bash.add_argument("--timeout", type=int, help="Timeout in seconds")
 
     # grep
     p_grep = sub.add_parser("grep", help="Search file contents")

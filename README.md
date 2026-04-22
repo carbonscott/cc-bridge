@@ -83,10 +83,22 @@ echo "content" | bridge write <path>       # from stdin
 ```bash
 bridge bash "pwd"
 bridge bash "python3 script.py"
-bridge bash "ls -la" --timeout 60          # custom timeout (seconds, default: 120)
+bridge --timeout 600 bash "long_running_cmd"   # custom timeout (default: 120s)
 ```
 
 Output is capped at 1 MB. Scope queries with flags or subdirectory paths to stay under the limit.
+
+### `--timeout` (global flag)
+
+Applies to `bash`, `grep`, and `glob`. Default is 120 seconds. Goes before the subcommand:
+
+```bash
+bridge --timeout 600 bash "long_running_cmd"
+bridge --timeout 30 grep "pattern" --path huge/tree
+bridge --timeout 30 glob '**/*.py'
+```
+
+If the subprocess exceeds the timeout, `bash` returns exit code `-1` with stderr `"command timed out after Ns"`; `grep`/`glob` return an error response.
 
 ### grep
 
